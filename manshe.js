@@ -32,7 +32,7 @@
 class ManShe extends ComicSource {
   name = "漫舍";
   key = "manshe";
-  version = "1.0.0";
+  version = "1.0.3";
   minAppVersion = "1.0.0";
   url = "";
 
@@ -155,20 +155,34 @@ class ManShe extends ComicSource {
       },
     },
     {
-      // 排行榜：日漫 / 国漫
+      // 排行榜：日漫 / 国漫 / 韩漫
+      //
+      // 「查看更多」跳转到分类页的对应榜单查看完整列表。
+      // viewMore 用**字符串格式**（旧版编码，所有 App 版本都支持）：
+      //   category:分类名@参数
+      // 注意：VeneraX 旧版解析时可能丢 @参数，所以 categoryComics.load
+      // 里对「日漫榜/国漫榜/韩漫榜」分类名本身也做了识别（双保险），
+      // 即使只传来分类名也能正确加载对应榜单。
+      // 不要改成 {page, attributes} 对象格式——那是较新版本才支持的，
+      // 旧版 App 解析不了会落到 "Invalid Data"，点击完全无响应。
       title: "漫舍 · 排行榜",
       type: "multiPartPage",
       load: async () => {
         const data = await this.apiGet("/app/api/rank/list");
         const out = [];
-        const lists = data.rank_list;
-        if (Array.isArray(lists)) {
-          for (const seg of lists) {
-            const title = seg && seg.name ? String(seg.name) : "榜单";
-            const comics = this.parseComicList(seg.comic_list);
-            if (comics.length > 0) {
-              out.push({ title: title, comics: comics });
-            }
+        const lists = Array.isArray(data.rank_list) ? data.rank_list : [];
+        const names = ["日漫榜", "国漫榜", "韩漫榜"];
+        for (let i = 0; i < lists.length; i++) {
+          const seg = lists[i];
+          const title = seg && seg.name ? String(seg.name) : (names[i] || "榜单");
+          const comics = this.parseComicList(seg && seg.comic_list);
+          if (comics.length > 0) {
+            out.push({
+              title: title,
+              // 只展示前 8 条作预览，完整榜单走「查看更多」
+              comics: comics.slice(0, 8),
+              viewMore: "category:" + (names[i] || title) + "@rank:" + (i + 1),
+            });
           }
         }
         if (out.length === 0) throw new Error("排行榜暂无数据");
@@ -200,6 +214,14 @@ class ManShe extends ComicSource {
         categoryParams: ["0", "1", "2", "3", "4", "5"],
         itemType: "category",
       },
+      {
+        // 排行榜三个榜单。「查看更多」跳转的目标分类就在这里
+        name: "排行榜",
+        type: "fixed",
+        categories: ["日漫榜", "国漫榜", "韩漫榜"],
+        categoryParams: ["rank:1", "rank:2", "rank:3"],
+        itemType: "category",
+      },
     ],
     enableRankingPage: true,
   };
@@ -208,27 +230,51 @@ class ManShe extends ComicSource {
     /**
      * 说明：这个后端没有提供可筛选、可翻页的分类接口
      * （/app/api/comic/list 等一律返回 data:null）。
-     * 所以这里退化为「综合列表」：所有分类都返回同一批数据，
+     * 所以普通分类退化为「综合列表」：所有分类都返回同一批数据，
      * 真正的筛选请走搜索。这是接口能力所限，不是解析问题。
+     *
+     * 排行榜命中做**双保险**（VeneraX 旧版解析字符串 viewMore 时不支持
+     * `@参数` 后缀，param 可能是 null）：
+     *   1. param 形如 "rank:N"（新版解析出 @参数）
+     *   2. category 为「日漫榜/国漫榜/韩漫榜」之一（旧版只传了分类名）
+     * 两种情况都走 loadRanking，保证「查看更多」不会落到综合列表。
      */
     load: async (category, param, options, page) => {
+      const p = param == null ? "" : String(param);
+      if (p.indexOf("rank:") === 0) {
+        return await this.loadRanking(parseInt(p.substring(5), 10));
+      }
+      const cat = category == null ? "" : String(category);
+      const rankIdx = ["日漫榜", "国漫榜", "韩漫榜"].indexOf(cat);
+      if (rankIdx >= 0) {
+        return await this.loadRanking(rankIdx + 1);
+      }
       if (page > 1) return { comics: [], maxPage: 1 };
       const data = await this.apiGet("/app/api/category/list");
       return { comics: this.parseComicList(data.category_list), maxPage: 1 };
     },
     ranking: {
-      options: ["day-日漫榜", "week-国漫榜"],
+      // 三个榜单与接口实际一致（原 day/week 与站点对不上、只有 2 项，故修正为 r1/r2/r3）
+      options: ["r1-日漫榜", "r2-国漫榜", "r3-韩漫榜"],
       load: async (option, page) => {
-        if (page > 1) return { comics: [], maxPage: 1 };
-        const data = await this.apiGet("/app/api/rank/list");
-        const lists = Array.isArray(data.rank_list) ? data.rank_list : [];
-        // rank_list 实际固定给 2~3 个榜单，按顺序取
-        const idx = option === "week" ? 1 : 0;
-        const seg = lists[idx] || lists[0];
-        return { comics: this.parseComicList(seg && seg.comic_list), maxPage: 1 };
+        const m = /^r([0-9]+)$/.exec(String(option == null ? "" : option));
+        const n = m ? parseInt(m[1], 10) : 1;
+        return await this.loadRanking(n);
       },
     },
   };
+
+  /**
+   * 取第 n 个榜单（1 基）。rank/list 固定返回 3 个榜单、每个 32 条，
+   * 无法翻页，所以 maxPage 恒为 1。
+   */
+  async loadRanking(n) {
+    const idx = isNaN(n) || n < 1 ? 0 : n - 1;
+    const data = await this.apiGet("/app/api/rank/list");
+    const lists = Array.isArray(data.rank_list) ? data.rank_list : [];
+    const seg = lists[idx] || lists[0];
+    return { comics: this.parseComicList(seg && seg.comic_list), maxPage: 1 };
+  }
 
   // ---------------- 搜索 ----------------
 
