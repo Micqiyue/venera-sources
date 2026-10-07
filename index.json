@@ -3,14 +3,15 @@
     "name": "漫舍",
     "fileName": "manshe.js",
     "key": "manshe",
-    "version": "1.0.0",
-    "description": "漫舍漫画源（api.manshe.top，App 包名 com.math.master）。首页分区/排行榜/综合列表、关键词搜索、详情与完整章节表、多线路图片（3 条 CDN 线路可选）。接口免登录免签名。"
+    "version": "1.0.0"
   },
   {
     "name": "Asura Scans",
     "fileName": "asura_scans.js",
     "key": "asura_scans",
     "version": "1.3.0",
-    "description": "Asura Scans 漫画源（asurascans.com）。榜单/题材筛选/搜索、完整章节与高清章节图、邮箱密码登录与站点收藏同步。章节顺序已归一化为「旧→新」，可在源设置切换。装好后需在「发现页设置」里勾选 Asura Scans 才会出现在发现页。"
-  }
+  },
+   { 
+     "name": "包子漫画（重制版）", "fileName": "baozimanhua.js", "key": "baozi_recode", "version": "1.1.7" 
+   }
 ]
