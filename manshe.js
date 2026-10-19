@@ -18,19 +18,17 @@
  *   GET /app/api/detail/{id}      → 详情 + 完整章节表
  *   GET /app/api/chapter/v3/{cid} → 章节图片
  *
+ * 2026-10-20 更新：图片线路域名已更换（旧 cdn.lzimg.xyz / i.lzimg.xyz DNS 失效）。
+ *   新 App 抓包 + config.img_generator 确认当前线路见 imgHosts。
+ *   后端接口字段无任何变化，搜索/详情/章节结构均与旧版一致。
+ *
  * 注意几个坑：
  *   1. 未知路由一律返回 200 + {"data":null}，不能靠状态码判断接口是否存在。
  *   2. 搜索固定返回 100 条，page/limit/offset 全部无效，无法真分页。
  *   3. rank/list 固定返回 3 个榜单，id/type 参数无效。
  *   4. 章节 id 是**全局唯一**的，所以 epId 记作 `comicID@chapterID`，
  *      取图时只打一次请求，不必先查详情。
- *   5. 图片是相对路径（如 /3/57/841832/1.jpg），要拼线路域名。
- *   6. 最新章节常出现「第N话」与「最新话」两个重复条目（同封面、同创建
- *      时间，服务器归一化到同一条记录），且最新话 id 的取图接口返回空
- *      pics。本源在 loadInfo 中自动跳过此类镜像条目。
- *   7. 章节接口 pics 为空不代表文件不存在：图片通常已上传到 CDN（与
- *      cover 同目录、同扩展名、从 1 开始连续编号，cover 本身即其中一页）。
- *      本源会在 pics 为空时按此规律兜底探测并缓存结果。
+ *   5. 图片是相对路径（如 /101/77748/xxx/1.jpg），要拼线路域名。
  *
  * 免责声明：本源仅做接口解析，不存储、不转载任何作品内容。
  */
@@ -38,7 +36,7 @@
 class ManShe extends ComicSource {
   name = "漫舍";
   key = "manshe";
-  version = "1.0.7";
+  version = "1.0.8";
   minAppVersion = "1.0.0";
   url = "";
 
@@ -48,12 +46,24 @@ class ManShe extends ComicSource {
   // 后端基址（实测只有这个通）
   apiBase = "http://api.manshe.top";
 
-  // 图片线路：实测 1/2/3 号线均返回 200 image/jpeg，内容一致
-  // （线路 4/5 走百度/QQ 中转，依赖 r 标志，这里不用，直接取源）
+  // 图片线路：2026-10-20 实测（抓包 + 直接请求 + 官方 img_generator 逻辑）
+  //   旧线路 cdn.lzimg.xyz / i.lzimg.xyz 已 DNS 失效（域名下线），不再使用
+  //   封面 /picY/xxx 与章节图 /101/xxx 取源站都在 media.imgo.buzz 上（同一源站）
+  //
+  //   Venera 里图片加载的坑（实测结论）：
+  //     ✗ http://img.mechat.fun  新 App 抓包在用，但 Venera 图片加载走 Flutter Image，
+  //                              明文 http 被 Android 9+ cleartext 策略拦 → 封面报错感叹号
+  //     ✗ https://media.imgo.buzz 直连：海外 CF，国内访问超时/不稳 → 封面一直占位
+  //     ✗ https://img.mechat.fun TLS 证书校验失败（源站不支持 https）
+  //     ✗ https://pic.lizimh.net / https://fmimg.lizimh.net  对普通路径 404
+  //
+  //   所以默认线路改用官方 img_generator 里的 img3（百度 CDN）/ img4（腾讯 CDN）中转：
+  //     https + 国内 CDN 可达，Venera 里能正常加载。
+  //   中转格式：<中转前缀> + encodeURIComponent("https://media.imgo.buzz" + 路径)
   imgHosts = [
-    "https://cdn.lzimg.xyz",
-    "https://i.lzimg.xyz",
-    "http://img.mechat.fun",
+    "https://gimg3.baidu.com/searchbox_feed/app=2001&fmt=auto&g=4n&n=0&q=100&refer=http%3A%2F%2Fwww.baidu.com&src=",
+    "https://page.e.qq.com/xjmaker/picture?url=",
+    "https://media.imgo.buzz",
   ];
 
   init() {
@@ -63,8 +73,6 @@ class ManShe extends ComicSource {
       Accept: "application/json, text/plain, */*",
       "Accept-Language": "zh-CN,zh;q=0.9",
     };
-    // 兜底取图结果缓存：chId → 图片 URL 列表（接口 pics 为空时使用）
-    this._fallbackPics = {};
   }
 
   // ---------------- 基础工具 ----------------
@@ -87,7 +95,13 @@ class ManShe extends ComicSource {
     const s = rel == null ? "" : String(rel).trim();
     if (!s) return "";
     if (s.indexOf("http") === 0) return s;
-    return this.getImgHost() + (s.charAt(0) === "/" ? s : "/" + s);
+    const host = this.getImgHost();
+    const p = s.charAt(0) === "/" ? s : "/" + s;
+    // 百度/腾讯中转线路：需要把「源站域名+路径」整体 URL 编码后拼到中转前缀后
+    if (host.indexOf("baidu.com") >= 0 || host.indexOf("qq.com") >= 0) {
+      return host + encodeURIComponent("https://media.imgo.buzz" + p);
+    }
+    return host + p;
   }
 
   /** 请求接口。注意未知路由也会返回 200，所以还要判 data */
@@ -330,24 +344,11 @@ class ManShe extends ComicSource {
       // 章节：接口已按 order 升序给出（oldest → newest）
       const chapters = new Map();
       const list = Array.isArray(d.chapters) ? d.chapters : [];
-      let prevCover = "";
-      let prevCreatedAt = "";
       for (const ch of list) {
         if (!ch || ch.id === null || typeof ch.id === "undefined") continue;
-        const name = ch.name ? String(ch.name) : "第 " + (ch.order || "?") + " 话";
-        // 去重：源站会给最新章节额外挂「最新话」镜像条目（同封面、同创建
-        // 时间，例：第214话 id=2551560 与 最新话 id=5103120 为同一章节，
-        // 且最新话 id 的取图接口返回空 pics）。跳过这类重复项，避免列表
-        // 出现两个相同章节、也避免点开取不到图。
-        if (/^最新/.test(name)) {
-          const cover = ch.cover ? String(ch.cover) : "";
-          const created = ch.created_at ? String(ch.created_at) : "";
-          if (cover && created && cover === prevCover && created === prevCreatedAt) continue;
-        }
-        prevCover = ch.cover ? String(ch.cover) : "";
-        prevCreatedAt = ch.created_at ? String(ch.created_at) : "";
         // 全局唯一章节 id；带上漫画 id 便于直接取图
         const epId = cid + "@" + ch.id;
+        const name = ch.name ? String(ch.name) : "第 " + (ch.order || "?") + " 话";
         if (chapters.has(epId)) continue;
         chapters.set(epId, name);
       }
@@ -373,7 +374,7 @@ class ManShe extends ComicSource {
       if (!cid || !chId) throw new Error("缺少章节信息");
       const d = await this.apiGet("/app/api/chapter/v3/" + chId);
       const pics = d && d.pics;
-      let images = [];
+      const images = [];
       if (Array.isArray(pics)) {
         for (const p of pics) {
           const u = this.imgUrl(typeof p === "string" ? p : p && p.url);
@@ -381,20 +382,18 @@ class ManShe extends ComicSource {
         }
       }
       if (images.length === 0) {
-        // 兜底：接口 pics 为空但 CDN 文件可能已上传
-        // （与 cover 同目录、同扩展名、从 1 连续编号）
-        images = await this.probeChapterImages(cid, chId);
-      }
-      if (images.length === 0) {
-        throw new Error("该话暂无图片（源站未返回，可能未更新、需登录或需 VIP）");
+        throw new Error("未解析到图片（该话可能需要 VIP）");
       }
       return { images: images };
     },
 
     // 实测图片域名无防盗链，带上 Referer 更保险
+    // 实测图片域名无防盗链；只对直连 imgo.buzz 加 Referer 更保险
+    // （百度/腾讯中转 URL 以 gimg3.baidu.com / page.e.qq.com 开头，不会命中，
+    //   第三方 CDN 不加 Referer 反而更稳）
     onImageLoad: (url) => {
       const u = String(url == null ? "" : url);
-      if (/lzimg\.xyz|mechat\.fun/.test(u)) {
+      if (/^https?:\/\/media\.imgo\.buzz/.test(u)) {
         return { headers: { Referer: this.site + "/" } };
       }
       return {};
@@ -402,7 +401,7 @@ class ManShe extends ComicSource {
 
     onThumbnailLoad: (url) => {
       const u = String(url == null ? "" : url);
-      if (/lzimg\.xyz|mechat\.fun/.test(u)) {
+      if (/^https?:\/\/media\.imgo\.buzz/.test(u)) {
         return { headers: { Referer: this.site + "/" } };
       }
       return {};
@@ -422,71 +421,6 @@ class ManShe extends ComicSource {
 
     enableTagsTranslate: false,
   };
-
-  /** 探测某个图片 URL 是否存在（非 200 或请求失败均视为不存在；失败重试 1 次） */
-  async httpExists(url) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const h = Object.assign({}, this.headers);
-        if (/lzimg\.xyz|mechat\.fun/.test(url)) h["Referer"] = this.site + "/";
-        const r = await Network.get(url, h);
-        if (r && r.status === 200) return true;
-      } catch (e) {}
-    }
-    return false;
-  }
-
-  /**
-   * 假设页码从 1 连续编号：二分查找 [lo, hi] 中最后一个存在的页码。
-   * 相比逐页扫描，能把探测请求数从「页数」降到「页数的对数」。
-   */
-  async findLastPage(dir, ext, lo, hi) {
-    while (lo < hi) {
-      const mid = Math.ceil((lo + hi) / 2);
-      if (await this.httpExists(this.imgUrl(dir + mid + "." + ext))) lo = mid;
-      else hi = mid - 1;
-    }
-    return lo;
-  }
-
-  /**
-   * 兜底取图：服务器 pics 为空时，从详情里取该章节的 cover，
-   * 按「同目录 / 同扩展名 / 从 1 连续编号、封面即其中一页」的规律恢复图片列表。
-   * 用封面页码做下界 + 二分找末尾，单话约 10 次请求，结果按章节缓存。
-   */
-  async probeChapterImages(cid, chId) {
-    if (!this._fallbackPics) this._fallbackPics = {};
-    if (this._fallbackPics[chId]) return this._fallbackPics[chId];
-    let out = [];
-    try {
-      const d = await this.apiGet("/app/api/detail/" + cid);
-      const list = Array.isArray(d.chapters) ? d.chapters : [];
-      const ch = list.find((x) => x && String(x.id) === String(chId));
-      const rel = ch && ch.cover ? String(ch.cover).trim() : "";
-      const m = rel.match(/^(.*\/)([0-9]+)\.([a-zA-Z0-9]+)$/);
-      if (m) {
-        const dir = m[1];
-        const ext = m[3];
-        const coverNum = parseInt(m[2], 10);
-        // 先确认首页与封面页确实可访问（文件已上传），避免对空章节做无谓探测
-        if (
-          coverNum >= 1 &&
-          (await this.httpExists(this.imgUrl(dir + "1." + ext))) &&
-          (await this.httpExists(this.imgUrl(rel)))
-        ) {
-          const hi = Math.min(coverNum + 200, 400); // 探测上限，防异常
-          const last = await this.findLastPage(dir, ext, coverNum, hi);
-          for (let i = 1; i <= last; i++) {
-            out.push(this.imgUrl(dir + i + "." + ext));
-          }
-        }
-      }
-    } catch (e) {
-      out = [];
-    }
-    if (out.length > 0) this._fallbackPics[chId] = out;
-    return out;
-  }
 
   /** 地区 id → 名称（配置里的 cfg_comic_class） */
   className(id) {
@@ -553,9 +487,9 @@ class ManShe extends ComicSource {
       title: "图片线路",
       type: "select",
       options: [
-        { value: "1", text: "线路1 cdn.lzimg.xyz" },
-        { value: "2", text: "线路2 i.lzimg.xyz" },
-        { value: "3", text: "线路3 img.mechat.fun" },
+        { value: "1", text: "线路1 百度CDN中转（默认）" },
+        { value: "2", text: "线路2 腾讯CDN中转" },
+        { value: "3", text: "线路3 imgo.buzz直连" },
       ],
       default: "1",
     },
